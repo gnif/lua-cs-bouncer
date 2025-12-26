@@ -808,7 +808,7 @@ function csmod.Allow(ip)
     end
 
     if not is_bouncer_enabled()  then
-      ngx.log(ngx.ERR, "bouncer disabled by user")
+      -- ngx.log(ngx.ERR, "bouncer disabled by user")
       ngx.exit(ngx.DECLINED)
     end
 
