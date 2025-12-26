@@ -1,36 +1,38 @@
 package.path = package.path .. ";./?.lua"
 
-local config = require "plugins.crowdsec.config"
+local config  = require "plugins.crowdsec.config"
 local iputils = require "plugins.crowdsec.iputils"
-local http = require "resty.http"
-local cjson = require "cjson"
+local http    = require "resty.http"
+local cjson   = require "cjson"
 local captcha = require "plugins.crowdsec.captcha"
-local flag = require "plugins.crowdsec.flag"
-local utils = require "plugins.crowdsec.utils"
-local ban = require "plugins.crowdsec.ban"
-local url = require "plugins.crowdsec.url"
+local flag    = require "plugins.crowdsec.flag"
+local utils   = require "plugins.crowdsec.utils"
+local ban     = require "plugins.crowdsec.ban"
+local url     = require "plugins.crowdsec.url"
 local metrics = require "plugins.crowdsec.metrics"
-local live = require "plugins.crowdsec.live"
-local stream = require "plugins.crowdsec.stream"
-local bit
+local live    = require "plugins.crowdsec.live"
+local stream  = require "plugins.crowdsec.stream"
 
+-- NEW: memcached-backed cache module (only used for captcha state)
+local mc_cache = require "plugins.crowdsec.cache"
+
+local bit
 if _VERSION == "Lua 5.1" then bit = require "bit" else bit = require "bit32" end
 
 local runtime = {}
-
 runtime.timer_started = false -- worker wide variable
 
 local csmod = {}
 
 local DENY = "deny"
 
-local APPSEC_API_KEY_HEADER = "x-crowdsec-appsec-api-key"
-local APPSEC_IP_HEADER = "x-crowdsec-appsec-ip"
-local APPSEC_HOST_HEADER = "x-crowdsec-appsec-host"
-local APPSEC_VERB_HEADER = "x-crowdsec-appsec-verb"
-local APPSEC_URI_HEADER = "x-crowdsec-appsec-uri"
-local APPSEC_USER_AGENT_HEADER = "x-crowdsec-appsec-user-agent"
-local REMEDIATION_API_KEY_HEADER = 'x-api-key'
+local APPSEC_API_KEY_HEADER     = "x-crowdsec-appsec-api-key"
+local APPSEC_IP_HEADER          = "x-crowdsec-appsec-ip"
+local APPSEC_HOST_HEADER        = "x-crowdsec-appsec-host"
+local APPSEC_VERB_HEADER        = "x-crowdsec-appsec-verb"
+local APPSEC_URI_HEADER         = "x-crowdsec-appsec-uri"
+local APPSEC_USER_AGENT_HEADER  = "x-crowdsec-appsec-user-agent"
+local REMEDIATION_API_KEY_HEADER = "x-api-key"
 local METRICS_PERIOD = 900
 
 --- only for debug purpose
@@ -80,8 +82,25 @@ local function is_always_send_to_appsec()
   if runtime.conf["ALWAYS_SEND_TO_APPSEC"] then --- this one is truly a boolean
     return true
   end
-
   return false
+end
+
+-- Helpers: ONLY captcha state goes to memcached-backed cache
+local function captcha_key(ip)
+  return "captcha_" .. ip
+end
+
+local function captcha_get(ip)
+  -- returns (previous_uri, flags)
+  return runtime.captcha_cache:get(captcha_key(ip))
+end
+
+local function captcha_set(ip, uri, ttl, flags)
+  return runtime.captcha_cache:set(captcha_key(ip), uri, ttl, flags)
+end
+
+local function captcha_del(ip)
+  return runtime.captcha_cache:delete(captcha_key(ip))
 end
 
 --- init function
@@ -94,15 +113,38 @@ function csmod.init(configFile, userAgent)
   if conf == nil then
     return nil, err
   end
+
   local localConf, _ = config.loadConfig(configFile .. ".local", false)
   if localConf ~= nil then
     for k, v in pairs(localConf) do
       conf[k] = v
     end
   end
+
   runtime.conf = conf
   runtime.userAgent = userAgent
+
+  -- IMPORTANT: keep normal ngx shared dict cache for everything else (metrics, decisions, etc.)
   runtime.cache = ngx.shared.crowdsec_cache
+
+  runtime.captcha_cache = mc_cache.new({
+    primary = runtime.conf["MEMCACHED_PRIMARY"],
+    backup  = runtime.conf["MEMCACHED_BACKUP"],
+
+    -- optional tuning (if you add these to your config)
+    timeout_ms   = tonumber(runtime.conf["MEMCACHED_TIMEOUT_MS"]) or 20,
+    keepalive_ms = tonumber(runtime.conf["MEMCACHED_KEEPALIVE_MS"]) or 60000,
+    pool_size    = tonumber(runtime.conf["MEMCACHED_POOL_SIZE"]) or 100,
+
+    primary_backoff_sec = 10,
+
+    key_prefix = runtime.conf["MEMCACHED_KEY_PREFIX"] or "crowdsec:captcha:",
+
+    shm = ngx.shared.crowdsec_cache,
+  })
+  ngx.log(ngx.ERR, "[crowdsec] memc primary=", tostring(runtime.conf["MEMCACHED_PRIMARY"]),
+                 " backup=", tostring(runtime.conf["MEMCACHED_BACKUP"]))
+
   runtime.fallback = runtime.conf["FALLBACK_REMEDIATION"]
 
   if runtime.conf["ENABLED"] == "false" then
@@ -689,9 +731,9 @@ function csmod.Allow(ip)
       ngx.log(ngx.ERR, "[Crowdsec] bouncer error: " .. err)
     end
 
-    -- if the ip is now allowed, try to delete its captcha state in cache
+    -- if the ip is now allowed, try to delete its captcha state in *memcached-backed* cache
     if ok == true then
-      ngx.shared.crowdsec_cache:delete("captcha_" .. ip)
+      captcha_del(ip)
     end
   end
   -- check with appSec if the remediation component doesn't have decisions for the IP
@@ -727,7 +769,7 @@ function csmod.Allow(ip)
   if captcha_ok then
     -- if captcha can be used (configuration is valid)
     -- we check if the IP needs to validate its captcha before checking it against CrowdSec local API
-    local previous_uri, flags = ngx.shared.crowdsec_cache:get("captcha_" .. ip)
+    local previous_uri, flags = captcha_get(ip)
     local source, state_id, err = flag.GetFlags(flags)
 
     if previous_uri ~= nil and state_id == flag.VERIFY_STATE then
@@ -750,10 +792,10 @@ function csmod.Allow(ip)
             -- we will not propose a captcha until the 'CAPTCHA_EXPIRATION'.
             -- But for the Application Security component, we serve the captcha each time the user triggers it.
             if source == flag.APPSEC_SOURCE then
-              ngx.shared.crowdsec_cache:delete("captcha_" .. ip)
+              captcha_del(ip)
             else
-              local succ, err, forcible = ngx.shared.crowdsec_cache:set(
-                "captcha_" .. ip,
+              local succ, err, forcible = captcha_set(
+                ip,
                 previous_uri,
                 runtime.conf["CAPTCHA_EXPIRATION"],
                 bit.bor(flag.VALIDATED_STATE, source)

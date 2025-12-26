@@ -1,8 +1,30 @@
 local config = {}
 
-local valid_params = {'ENABLED', 'ENABLE_INTERNAL', 'API_URL', 'API_KEY', 'BOUNCING_ON_TYPE', 'MODE', 'SECRET_KEY', 'SITE_KEY', 'BAN_TEMPLATE_PATH' ,'CAPTCHA_TEMPLATE_PATH', 'REDIRECT_LOCATION', 'RET_CODE', 'CAPTCHA_RET_CODE', 'EXCLUDE_LOCATION', 'FALLBACK_REMEDIATION', 'CAPTCHA_PROVIDER', 'APPSEC_URL', 'APPSEC_FAILURE_ACTION', 'ALWAYS_SEND_TO_APPSEC', 'SSL_VERIFY', 'USE_TLS_AUTH', 'TLS_CLIENT_CERT', 'TLS_CLIENT_KEY'}
-local valid_int_params = {'CACHE_EXPIRATION', 'CACHE_SIZE', 'REQUEST_TIMEOUT', 'UPDATE_FREQUENCY', 'CAPTCHA_EXPIRATION', 'APPSEC_CONNECT_TIMEOUT', 'APPSEC_SEND_TIMEOUT', 'APPSEC_PROCESS_TIMEOUT', 'STREAM_REQUEST_TIMEOUT'}
--- CACHE_SIZE is not used in the code, but as is was valid parameter for the configuration file, not removing it now
+local valid_params = {
+  'ENABLED', 'ENABLE_INTERNAL', 'API_URL', 'API_KEY', 'BOUNCING_ON_TYPE', 'MODE',
+  'SECRET_KEY', 'SITE_KEY', 'BAN_TEMPLATE_PATH' ,'CAPTCHA_TEMPLATE_PATH',
+  'REDIRECT_LOCATION', 'RET_CODE', 'CAPTCHA_RET_CODE', 'EXCLUDE_LOCATION',
+  'FALLBACK_REMEDIATION', 'CAPTCHA_PROVIDER', 'APPSEC_URL', 'APPSEC_FAILURE_ACTION',
+  'ALWAYS_SEND_TO_APPSEC', 'SSL_VERIFY', 'USE_TLS_AUTH', 'TLS_CLIENT_CERT', 'TLS_CLIENT_KEY',
+
+  'MEMCACHED_PRIMARY',
+  'MEMCACHED_BACKUP',
+  'MEMCACHED_KEY_PREFIX',
+}
+
+local valid_int_params = {
+  'CACHE_EXPIRATION', 'CACHE_SIZE', 'REQUEST_TIMEOUT', 'UPDATE_FREQUENCY',
+  'CAPTCHA_EXPIRATION', 'APPSEC_CONNECT_TIMEOUT', 'APPSEC_SEND_TIMEOUT',
+  'APPSEC_PROCESS_TIMEOUT', 'STREAM_REQUEST_TIMEOUT',
+
+  'MEMCACHED_PORT',
+  'MEMCACHED_TIMEOUT_MS',
+  'MEMCACHED_KEEPALIVE_MS',
+  'MEMCACHED_POOL_SIZE',
+  'MEMCACHED_PRIMARY_BACKOFF_SEC',
+}
+
+-- CACHE_SIZE is not used in the code, but as it was valid parameter for the configuration file, not removing it now
 local valid_bouncing_on_type_values = {'ban', 'captcha', 'all'}
 local valid_truefalse_values = {'false', 'true'}
 local default_values = {
@@ -31,8 +53,16 @@ local default_values = {
     ['USE_TLS_AUTH'] = "false",
     ['TLS_CLIENT_CERT'] = "",
     ['TLS_CLIENT_KEY'] = "",
+ 
+    ['MEMCACHED_PRIMARY'] = "",
+    ['MEMCACHED_BACKUP']  = "",
+    ['MEMCACHED_KEY_PREFIX'] = "",
+    ['MEMCACHED_PORT'] = 11211,
+    ['MEMCACHED_TIMEOUT_MS'] = 50,
+    ['MEMCACHED_KEEPALIVE_MS'] = 60000,
+    ['MEMCACHED_POOL_SIZE'] = 200,
+    ['MEMCACHED_PRIMARY_BACKOFF_SEC'] = 10
 }
-
 
 function config.file_exists(file)
     local f = io.open(file, "rb")
