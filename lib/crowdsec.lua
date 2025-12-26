@@ -922,14 +922,24 @@ function csmod.Allow(ip)
       -- if the remediation is a captcha and captcha is well configured
       if remediation == "captcha" and captcha_ok and ngx.var.uri ~= "/favicon.ico" then
           local token = nil
+	  local previous_uri = nil
+	  local flags = nil
           if captcha_state_mode() ~= "ip" then
             token = get_sanitized_captcha_token()
 	    if not token then
               token = generate_captcha_token()
 	      set_captcha_cookie(token)
+	    else
+              previous_uri, flags = captcha_get(ip, token)
+	      if previous_uri == nil or flags == nil then
+                token = generate_captcha_token()
+	        set_captcha_cookie(token)
+              end
             end
-          end
-          local previous_uri, flags = captcha_get(ip, token)
+          else
+            previous_uri, flags = captcha_get(ip, token)
+	  end
+
           local source, state_id, err = flag.GetFlags(flags)
           -- we check if the IP is already in cache for captcha and not yet validated
           if previous_uri == nil or state_id ~= flag.VALIDATED_STATE or remediationSource == flag.APPSEC_SOURCE then 
