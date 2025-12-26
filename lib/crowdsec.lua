@@ -169,6 +169,10 @@ end
 local function set_captcha_cookie(token)
   local name = captcha_cookie_name()
   local attributes = { "Path=/", "HttpOnly", "SameSite=Lax" }
+  local domain = runtime.conf["CAPTCHA_COOKIE_DOMAIN"]
+  if domain and domain ~= "" then
+    table.insert(attributes, "Domain=" .. domain)
+  end
   if ngx.var.https == "on" then
     table.insert(attributes, "Secure")
   end
