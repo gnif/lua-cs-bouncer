@@ -173,9 +173,7 @@ local function set_captcha_cookie(token)
   if domain and domain ~= "" then
     table.insert(attributes, "Domain=" .. domain)
   end
-  if ngx.var.https == "on" then
-    table.insert(attributes, "Secure")
-  end
+  table.insert(attributes, "HttpOnly")
   local ttl = tonumber(runtime.conf["CAPTCHA_EXPIRATION"])
   if ttl and ttl > 0 then
     table.insert(attributes, "Max-Age=" .. ttl)
