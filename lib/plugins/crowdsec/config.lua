@@ -6,6 +6,7 @@ local valid_params = {
   'REDIRECT_LOCATION', 'RET_CODE', 'CAPTCHA_RET_CODE', 'EXCLUDE_LOCATION',
   'FALLBACK_REMEDIATION', 'CAPTCHA_PROVIDER', 'APPSEC_URL', 'APPSEC_FAILURE_ACTION',
   'ALWAYS_SEND_TO_APPSEC', 'SSL_VERIFY', 'USE_TLS_AUTH', 'TLS_CLIENT_CERT', 'TLS_CLIENT_KEY',
+  'CAPTCHA_COOKIE_NAME', 'CAPTCHA_STATE',
 
   'MEMCACHED_PRIMARY',
   'MEMCACHED_BACKUP',
@@ -27,6 +28,7 @@ local valid_int_params = {
 -- CACHE_SIZE is not used in the code, but as it was valid parameter for the configuration file, not removing it now
 local valid_bouncing_on_type_values = {'ban', 'captcha', 'all'}
 local valid_truefalse_values = {'false', 'true'}
+local valid_captcha_state_values = {'ip', 'cookie', 'cookie_ip'}
 local default_values = {
     ['ENABLED'] = "true",
     ['ENABLE_INTERNAL'] = "false",
@@ -53,6 +55,8 @@ local default_values = {
     ['USE_TLS_AUTH'] = "false",
     ['TLS_CLIENT_CERT'] = "",
     ['TLS_CLIENT_KEY'] = "",
+    ['CAPTCHA_COOKIE_NAME'] = "crowdsec_captcha",
+    ['CAPTCHA_STATE'] = "ip",
  
     ['MEMCACHED_PRIMARY'] = "",
     ['MEMCACHED_BACKUP']  = "",
@@ -151,6 +155,11 @@ function config.loadConfig(file, default)
                 if not has_value({'captcha', 'ban'}, value) then
                 ngx.log(ngx.ERR, "unsupported value '" .. value .. "' for variable '" .. key .. "'. Using default value 'ban' instead")
                 value = "ban"
+                end
+            elseif key == "CAPTCHA_STATE" then
+                if not has_value(valid_captcha_state_values, value) then
+                ngx.log(ngx.ERR, "unsupported value '" .. value .. "' for variable '" .. key .. "'. Using default value 'ip' instead")
+                value = "ip"
                 end
             end
             conf[key] = value
