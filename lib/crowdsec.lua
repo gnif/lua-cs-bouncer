@@ -263,6 +263,7 @@ function csmod.init(configFile, userAgent)
 
   if runtime.conf["REDIRECT_LOCATION"] ~= "" then
     table.insert(runtime.conf["EXCLUDE_LOCATION"], runtime.conf["REDIRECT_LOCATION"])
+    ngx.exit(ngx.DECLINED)
   end
 
   if runtime.conf["SSL_VERIFY"] == "false" then
@@ -815,15 +816,6 @@ function csmod.Allow(ip)
     ok, remediation, err = csmod.allowIp(ip)
     if err ~= nil then
       ngx.log(ngx.ERR, "[Crowdsec] bouncer error: " .. err)
-    end
-
-    -- if the ip is now allowed, try to delete its captcha state in *memcached-backed* cache
-    if ok == true then
-      local token = nil
-      if captcha_state_mode() ~= "ip" then
-        token = get_captcha_token()
-      end
-      captcha_del(ip, token)
     end
   end
   -- check with appSec if the remediation component doesn't have decisions for the IP
