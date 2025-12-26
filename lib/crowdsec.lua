@@ -147,15 +147,29 @@ local function captcha_cookie_name()
   return runtime.conf["CAPTCHA_COOKIE_NAME"] or "crowdsec_captcha"
 end
 
-local function get_captcha_token()
-  local name = captcha_cookie_name()
-  return ngx.var["cookie_" .. name]
+local function get_sanitized_captcha_token()
+  local name  = captcha_cookie_name()
+  local token = ngx.var["cookie_" .. name]
+  if type(token) ~= "string" then
+    return nil
+  end
+
+  token = token:match("^%s*(.-)%s*$") -- trim
+  if #token ~= 32 then
+    return nil
+  end
+
+  token = token:lower()
+  if not token:match("^%x+$") then
+    return nil
+  end
+  return token
 end
 
 local function generate_captcha_token()
   local request_id = ngx.var.request_id
   if request_id and request_id ~= "" then
-    return request_id
+    return ngx.md5(request_id)
   end
   local entropy = table.concat({
     tostring(ngx.now()),
@@ -173,22 +187,11 @@ local function set_captcha_cookie(token)
   if domain and domain ~= "" then
     table.insert(attributes, "Domain=" .. domain)
   end
-  table.insert(attributes, "HttpOnly")
   local ttl = tonumber(runtime.conf["CAPTCHA_EXPIRATION"])
   if ttl and ttl > 0 then
     table.insert(attributes, "Max-Age=" .. ttl)
   end
   add_set_cookie(name .. "=" .. token .. "; " .. table.concat(attributes, "; "))
-end
-
-local function ensure_captcha_token()
-  local token = get_captcha_token()
-  if token and token ~= "" then
-    return token
-  end
-  token = generate_captcha_token()
-  set_captcha_cookie(token)
-  return token
 end
 
 --- init function
@@ -855,8 +858,9 @@ function csmod.Allow(ip)
     -- we check if the IP needs to validate its captcha before checking it against CrowdSec local API
     local token = nil
     if captcha_state_mode() ~= "ip" then
-      token = get_captcha_token()
+      token = get_sanitized_captcha_token()
     end
+
     local previous_uri, flags = captcha_get(ip, token)
     local source, state_id, err = flag.GetFlags(flags)
 
@@ -919,9 +923,12 @@ function csmod.Allow(ip)
       if remediation == "captcha" and captcha_ok and ngx.var.uri ~= "/favicon.ico" then
           local token = nil
           if captcha_state_mode() ~= "ip" then
-            token = ensure_captcha_token()
+            token = get_sanitized_captcha_token()
+	    if not token then
+              token = generate_captcha_token()
+	      set_captcha_cookie(token)
+            end
           end
-          local cache_key = captcha_key(ip, token)
           local previous_uri, flags = captcha_get(ip, token)
           local source, state_id, err = flag.GetFlags(flags)
           -- we check if the IP is already in cache for captcha and not yet validated
@@ -944,6 +951,7 @@ function csmod.Allow(ip)
                 bit.bor(flag.VERIFY_STATE, remediationSource)
               )
               if not succ then
+                local cache_key = captcha_key(ip, token)
                 ngx.log(ngx.ERR, "failed to add key about captcha state '" .. tostring(cache_key) .. "' in cache: "..err)
               end
               ngx.log(ngx.ALERT, "[Crowdsec] denied '" .. ip .. "' with '"..remediation.."'")
