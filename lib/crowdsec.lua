@@ -147,25 +147,6 @@ local function captcha_cookie_name()
   return runtime.conf["CAPTCHA_COOKIE_NAME"] or "crowdsec_captcha"
 end
 
-local function get_sanitized_captcha_token()
-  local name  = captcha_cookie_name()
-  local token = ngx.var["cookie_" .. name]
-  if type(token) ~= "string" then
-    return nil
-  end
-
-  token = token:match("^%s*(.-)%s*$") -- trim
-  if #token ~= 32 then
-    return nil
-  end
-
-  token = token:lower()
-  if not token:match("^%x+$") then
-    return nil
-  end
-  return token
-end
-
 local function generate_captcha_token()
   local request_id = ngx.var.request_id
   if request_id and request_id ~= "" then
@@ -180,18 +161,88 @@ local function generate_captcha_token()
   return ngx.md5(entropy)
 end
 
-local function set_captcha_cookie(token)
+local function hex_encode(bin)
+  return (bin:gsub(".", function(c)
+    return string.format("%02x", string.byte(c))
+  end))
+end
+
+local function const_time_eq(a, b)
+  if #a ~= #b then return false end
+  local r = 0
+  for i = 1, #a do
+    r = bit.bor(r, bit.bxor(a:byte(i), b:byte(i)))
+  end
+  return r == 0
+end
+
+local function sign_cookie_value(token, exp_unix)
+  -- No runtime.conf validation here by request
+  local data = token .. "." .. tostring(exp_unix)
+  return hex_encode(ngx.hmac_sha1(runtime.conf["SECRET_KEY"], data))
+end
+
+local function parse_and_verify_captcha_cookie()
   local name = captcha_cookie_name()
+  local raw  = ngx.var["cookie_" .. name]
+  if type(raw) ~= "string" or raw == "" then
+    return nil, false
+  end
+  raw = raw:match("^%s*(.-)%s*$") -- trim
+
+  -- token(32hex).exp(digits).sig(hex)
+  local token, exp_s, sig = raw:match(
+    "^(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x)%.(%d+)%.(%x+)$"
+  )
+  if not token or not exp_s or not sig then
+    return nil, false
+  end
+
+  token = token:lower()
+  local exp_unix = tonumber(exp_s)
+  if not exp_unix then
+    return nil, false
+  end
+
+  local expected = sign_cookie_value(token, exp_unix)
+
+  if not const_time_eq(sig:lower(), expected:lower()) then
+    return nil, false
+  end
+
+  local now = ngx.time()
+  if exp_unix <= now then
+    return nil, false
+  end
+
+  -- Rotate when remaining <= min(300, ttl/10) clamped to >= 60 (derived from CAPTCHA_EXPIRATION)
+  local ttl = tonumber(runtime.conf["CAPTCHA_EXPIRATION"])
+  local w = math.floor(ttl / 10)
+  if w < 60 then w = 60 end
+  if w > 300 then w = 300 end
+  local rotate = (exp_unix - now) <= w
+
+  return token, rotate
+end
+
+local function set_captcha_cookie_signed(token)
+  local name = captcha_cookie_name()
+
+  local ttl = tonumber(runtime.conf["CAPTCHA_EXPIRATION"])
+  local exp_unix = ngx.time() + ttl
+
+  local sig = sign_cookie_value(token, exp_unix)
+  local cookie_val = token .. "." .. tostring(exp_unix) .. "." .. sig
+
   local attributes = { "Path=/", "HttpOnly", "SameSite=Lax" }
   local domain = runtime.conf["CAPTCHA_COOKIE_DOMAIN"]
   if domain and domain ~= "" then
     table.insert(attributes, "Domain=" .. domain)
   end
-  local ttl = tonumber(runtime.conf["CAPTCHA_EXPIRATION"])
-  if ttl and ttl > 0 then
-    table.insert(attributes, "Max-Age=" .. ttl)
-  end
-  add_set_cookie(name .. "=" .. token .. "; " .. table.concat(attributes, "; "))
+  table.insert(attributes, "Max-Age=" .. tostring(ttl))
+
+  add_set_cookie(name .. "=" .. cookie_val .. "; " .. table.concat(attributes, "; "))
+  return true
 end
 
 --- init function
@@ -858,7 +909,7 @@ function csmod.Allow(ip)
     -- we check if the IP needs to validate its captcha before checking it against CrowdSec local API
     local token = nil
     if captcha_state_mode() ~= "ip" then
-      token = get_sanitized_captcha_token()
+      token, _ = parse_and_verify_captcha_cookie()
     end
 
     local previous_uri, flags = captcha_get(ip, token)
@@ -921,25 +972,28 @@ function csmod.Allow(ip)
       end
       -- if the remediation is a captcha and captcha is well configured
       if remediation == "captcha" and captcha_ok and ngx.var.uri ~= "/favicon.ico" then
-          local token = nil
+          local token        = nil
 	  local previous_uri = nil
-	  local flags = nil
+	  local flags        = nil
+
           if captcha_state_mode() ~= "ip" then
-            token = get_sanitized_captcha_token()
-	    if not token then
+            local rotate
+            token, rotate = parse_and_verify_captcha_cookie()
+
+            if not token then
               token = generate_captcha_token()
-	      set_captcha_cookie(token)
-	    else
-              previous_uri, flags = captcha_get(ip, token)
-	      if previous_uri == nil or flags == nil then
+              set_captcha_cookie_signed(token)
+            elseif rotate then
+              local prev_uri_tmp, flags_tmp = captcha_get(ip, token)
+              local _, state_id_tmp = flag.GetFlags(flags_tmp)
+              if prev_uri_tmp == nil or state_id_tmp == flag.VALIDATED_STATE then
                 token = generate_captcha_token()
-	        set_captcha_cookie(token)
+                set_captcha_cookie_signed(token)
               end
             end
-          else
-            previous_uri, flags = captcha_get(ip, token)
 	  end
 
+          previous_uri, flags = captcha_get(ip, token)
           local source, state_id, err = flag.GetFlags(flags)
           -- we check if the IP is already in cache for captcha and not yet validated
           if previous_uri == nil or state_id ~= flag.VALIDATED_STATE or remediationSource == flag.APPSEC_SOURCE then 
