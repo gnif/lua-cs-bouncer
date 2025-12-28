@@ -262,16 +262,16 @@ local function captcha_cookie_domain()
     return domain
   end
 
-  local server_name = ngx.var.server_name or ""
-  if server_name == "" then
-    server_name = ngx.var.host or ""
+  local host = ngx.var.http_host or ""
+  if host == "" then
+    host = ngx.var.host or ""
   end
-  if server_name == "" then
-    ngx.log(ngx.WARN, "unable to derive CAPTCHA cookie domain: empty server name")
+  if host == "" then
+    ngx.log(ngx.WARN, "unable to derive CAPTCHA cookie domain: empty host header")
     return nil
   end
 
-  local replaced, _, err = ngx.re.gsub(server_name, pattern, replacement, flags)
+  local replaced, _, err = ngx.re.gsub(host, pattern, replacement, flags)
   if not replaced then
     ngx.log(ngx.ERR, "invalid CAPTCHA_COOKIE_DOMAIN regex: " .. (err or "unknown error"))
     return nil
