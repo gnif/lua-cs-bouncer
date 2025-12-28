@@ -225,6 +225,64 @@ local function parse_and_verify_captcha_cookie()
   return token, rotate
 end
 
+local function escape_lua_pattern_char(ch)
+  return ch:gsub("(%W)", "%%%1")
+end
+
+local function parse_regex_substitution(expr)
+  if not expr or expr == "" then
+    return nil
+  end
+  if expr:sub(1, 1) ~= "s" then
+    return nil
+  end
+
+  local delim = expr:sub(2, 2)
+  if delim == "" then
+    return nil
+  end
+
+  local d = escape_lua_pattern_char(delim)
+  local pattern, replacement, flags = expr:match("^s" .. d .. "(.-)" .. d .. "(.-)" .. d .. "([a-zA-Z]*)$")
+  if not pattern then
+    return nil
+  end
+
+  return pattern, replacement, flags
+end
+
+local function captcha_cookie_domain()
+  local domain = runtime.conf["CAPTCHA_COOKIE_DOMAIN"]
+  if not domain or domain == "" then
+    return nil
+  end
+
+  local pattern, replacement, flags = parse_regex_substitution(domain)
+  if not pattern then
+    return domain
+  end
+
+  local server_name = ngx.var.server_name or ""
+  if server_name == "" then
+    server_name = ngx.var.host or ""
+  end
+  if server_name == "" then
+    ngx.log(ngx.WARN, "unable to derive CAPTCHA cookie domain: empty server name")
+    return nil
+  end
+
+  local replaced, _, err = ngx.re.gsub(server_name, pattern, replacement, flags)
+  if not replaced then
+    ngx.log(ngx.ERR, "invalid CAPTCHA_COOKIE_DOMAIN regex: " .. (err or "unknown error"))
+    return nil
+  end
+  if replaced == "" then
+    return nil
+  end
+
+  return replaced
+end
+
 local function set_captcha_cookie_signed(token)
   local name = captcha_cookie_name()
 
@@ -235,7 +293,7 @@ local function set_captcha_cookie_signed(token)
   local cookie_val = token .. "." .. tostring(exp_unix) .. "." .. sig
 
   local attributes = { "Path=/", "HttpOnly", "SameSite=Lax" }
-  local domain = runtime.conf["CAPTCHA_COOKIE_DOMAIN"]
+  local domain = captcha_cookie_domain()
   if domain and domain ~= "" then
     table.insert(attributes, "Domain=" .. domain)
   end
