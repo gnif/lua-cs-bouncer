@@ -129,10 +129,14 @@ end
 function _M:_try_op_on(server, op_fn)
   local mc, err = self:_connect(server)
   if not mc then
-    return nil, nil, err
+    return nil, nil, err, false
   end
 
   local res, flags, op_err = op_fn(mc)
+  if op_err == nil and type(flags) == "string" and (res == nil or res == false) then
+    op_err = flags
+    flags = nil
+  end
 
   -- now return socket to pool
   local ok2, err2 = mc:set_keepalive(self.keepalive_ms, self.pool_size)
@@ -140,7 +144,7 @@ function _M:_try_op_on(server, op_fn)
     ngx.log(ngx.ERR, "[crowdsec][memc] set_keepalive failed: ", err2 or "unknown")
   end
 
-  return res, flags, op_err
+  return res, flags, op_err, true
 end
 
 function _M:_memc_get(k)
@@ -148,24 +152,30 @@ function _M:_memc_get(k)
 
   local primary_down_until = self:_primary_down_until()
   if self.primary and primary_down_until <= now() then
-    local res, flags, err = self:_try_op_on(self.primary, function(mc)
+    local res, flags, err, connected = self:_try_op_on(self.primary, function(mc)
       return mc:get(key)
     end)
 
-    if err == nil then
-      -- primary works; clear any previous down marker
-      self:_clear_primary_down()
-      return res, flags, nil, "primary"
+    if connected then
+      if err == nil then
+        -- primary works; clear any previous down marker
+        self:_clear_primary_down()
+        return res, flags, nil, "primary"
+      end
+
+      if is_not_found(err) then
+        -- miss is not an error
+        self:_clear_primary_down()
+        return nil, nil, "NOT_FOUND", "primary"
+      end
+
+      ngx.log(ngx.ERR, "[crowdsec][memc] primary get error: ", err)
+      return nil, nil, err, "primary"
     end
 
-    if not is_not_found(err) then
-      -- real error talking to primary -> mark down
-      ngx.log(ngx.ERR, "[crowdsec][memc] primary get error: ", err)
-      self:_mark_primary_down()
-    else
-      -- miss is not an error
-      return nil, nil, "NOT_FOUND", "primary"
-    end
+    -- connection failure talking to primary -> mark down
+    ngx.log(ngx.ERR, "[crowdsec][memc] primary get connect error: ", err)
+    self:_mark_primary_down()
   end
 
   -- if primary is down/backing off, or failed: use backup if present
@@ -192,20 +202,23 @@ function _M:_memc_set(k, value, ttl, flags)
 
   local primary_down_until = self:_primary_down_until()
   if self.primary and primary_down_until <= now() then
-    local ok, _, err = self:_try_op_on(self.primary, function(mc)
+    local ok, _, err, connected = self:_try_op_on(self.primary, function(mc)
       -- lua-resty-memcached signature: set(key, value, exptime, flags)
       return mc:set(key, value, ttl, flags)
     end)
 
-    if ok then
-      self:_clear_primary_down()
-      return true, nil, "primary"
+    if connected then
+      if ok then
+        self:_clear_primary_down()
+        return true, nil, "primary"
+      end
+
+      ngx.log(ngx.ERR, "[crowdsec][memc] primary set error: ", err or "set failed")
+      return false, err or "set failed", "primary"
     end
 
-    if err then
-      ngx.log(ngx.ERR, "[crowdsec][memc] primary set error: ", err)
-      self:_mark_primary_down()
-    end
+    ngx.log(ngx.ERR, "[crowdsec][memc] primary set connect error: ", err)
+    self:_mark_primary_down()
   end
 
   if self.backup then
@@ -228,19 +241,22 @@ function _M:_memc_delete(k)
 
   local primary_down_until = self:_primary_down_until()
   if self.primary and primary_down_until <= now() then
-    local ok, _, err = self:_try_op_on(self.primary, function(mc)
+    local ok, _, err, connected = self:_try_op_on(self.primary, function(mc)
       return mc:delete(key)
     end)
 
-    if ok or is_not_found(err) then
-      self:_clear_primary_down()
-      return true, nil, "primary"
+    if connected then
+      if ok or is_not_found(err) then
+        self:_clear_primary_down()
+        return true, nil, "primary"
+      end
+
+      ngx.log(ngx.ERR, "[crowdsec][memc] primary delete error: ", err or "delete failed")
+      return false, err or "delete failed", "primary"
     end
 
-    if err then
-      ngx.log(ngx.ERR, "[crowdsec][memc] primary delete error: ", err)
-      self:_mark_primary_down()
-    end
+    ngx.log(ngx.ERR, "[crowdsec][memc] primary delete connect error: ", err)
+    self:_mark_primary_down()
   end
 
   if self.backup then
@@ -322,4 +338,3 @@ function _M:delete(k)
 end
 
 return _M
-
