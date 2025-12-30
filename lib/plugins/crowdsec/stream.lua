@@ -245,10 +245,6 @@ function stream:stream_query_process(res, bouncing_on_type)
       else
         ngx.log(ngx.WARN, "[Crowdsec] Failed to parse decision value for deletion: " .. tostring(decision.value) .. " with scope: " .. tostring(decision.scope))
       end
-      -- cache space for captcha is different it's used to cache if the captcha has been solved
-      if decision.type == "captcha" then
-        stream.cache:delete("captcha_" .. decision.value)
-      end
       if key ~= nil then
         local cache_value = stream.cache:get(key)
         if cache_value ~= nil then

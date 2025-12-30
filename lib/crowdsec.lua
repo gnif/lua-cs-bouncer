@@ -13,9 +13,6 @@ local metrics = require "plugins.crowdsec.metrics"
 local live    = require "plugins.crowdsec.live"
 local stream  = require "plugins.crowdsec.stream"
 
--- NEW: memcached-backed cache module (only used for captcha state)
-local mc_cache = require "plugins.crowdsec.cache"
-
 local bit
 if _VERSION == "Lua 5.1" then bit = require "bit" else bit = require "bit32" end
 
@@ -85,50 +82,6 @@ local function is_always_send_to_appsec()
   return false
 end
 
--- Helpers: ONLY captcha state goes to memcached-backed cache
-local function captcha_state_mode()
-  return runtime.conf["CAPTCHA_STATE"] or "ip"
-end
-
-local function captcha_key(ip, token)
-  local mode = captcha_state_mode()
-  if mode == "ip" then
-    return "captcha_" .. ip
-  end
-  if not token or token == "" then
-    return nil
-  end
-  if mode == "cookie" then
-    return "captcha_" .. token
-  end
-  return "captcha_" .. token .. ":" .. ip
-end
-
-local function captcha_get(ip, token)
-  -- returns (previous_uri, flags)
-  local key = captcha_key(ip, token)
-  if not key then
-    return nil, nil
-  end
-  return runtime.captcha_cache:get(key)
-end
-
-local function captcha_set(ip, token, uri, ttl, flags)
-  local key = captcha_key(ip, token)
-  if not key then
-    return nil, "missing captcha token"
-  end
-  return runtime.captcha_cache:set(key, uri, ttl, flags)
-end
-
-local function captcha_del(ip, token)
-  local key = captcha_key(ip, token)
-  if not key then
-    return nil, "missing captcha token"
-  end
-  return runtime.captcha_cache:delete(key)
-end
-
 local function add_set_cookie(cookie_value)
   local existing = ngx.header["Set-Cookie"]
   if not existing then
@@ -147,20 +100,6 @@ local function captcha_cookie_name()
   return runtime.conf["CAPTCHA_COOKIE_NAME"] or "crowdsec_captcha"
 end
 
-local function generate_captcha_token()
-  local request_id = ngx.var.request_id
-  if request_id and request_id ~= "" then
-    return ngx.md5(request_id)
-  end
-  local entropy = table.concat({
-    tostring(ngx.now()),
-    tostring(math.random()),
-    tostring(ngx.var.connection or ""),
-    tostring(ngx.var.remote_addr or ""),
-  }, "|")
-  return ngx.md5(entropy)
-end
-
 local function hex_encode(bin)
   return (bin:gsub(".", function(c)
     return string.format("%02x", string.byte(c))
@@ -176,9 +115,8 @@ local function const_time_eq(a, b)
   return r == 0
 end
 
-local function sign_cookie_value(token, exp_unix)
-  -- No runtime.conf validation here by request
-  local data = token .. "." .. tostring(exp_unix)
+local function sign_cookie_value(payload_b64, unix_time)
+  local data = payload_b64 .. "." .. tostring(unix_time)
   return hex_encode(ngx.hmac_sha1(runtime.conf["SECRET_KEY"], data))
 end
 
@@ -186,43 +124,57 @@ local function parse_and_verify_captcha_cookie()
   local name = captcha_cookie_name()
   local raw  = ngx.var["cookie_" .. name]
   if type(raw) ~= "string" or raw == "" then
-    return nil, false
+    return false, nil, nil
   end
   raw = raw:match("^%s*(.-)%s*$") -- trim
 
-  -- token(32hex).exp(digits).sig(hex)
-  local token, exp_s, sig = raw:match(
-    "^(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x)%.(%d+)%.(%x+)$"
-  )
-  if not token or not exp_s or not sig then
-    return nil, false
+  -- payload(base64).exp(digits).sig(hex)
+  local payload_b64, cookie_time, sig = raw:match("^([A-Za-z0-9+/=]+)%.(%d+)%.(%x+)$")
+  if not payload_b64 or not cookie_time or not sig then
+    return false, nil, nil
   end
 
-  token = token:lower()
-  local exp_unix = tonumber(exp_s)
-  if not exp_unix then
-    return nil, false
+  local cookie_time = tonumber(cookie_time)
+  if not cookie_time then
+    return false, nil, nil
   end
 
-  local expected = sign_cookie_value(token, exp_unix)
+  -- check for expiration
+  local now     = ngx.time()
+  local expired = (now - cookie_time) > runtime.conf["CAPTCHA_EXPIRATION"]
+  if expired then
+    return false, nil, nil
+  end
 
+  -- check the signature is valid
+  local expected = sign_cookie_value(payload_b64, cookie_time)
   if not const_time_eq(sig:lower(), expected:lower()) then
-    return nil, false
+    return false, nil, nil
   end
 
-  local now = ngx.time()
-  if exp_unix <= now then
-    return nil, false
+  -- decode the payload
+  local payload = ngx.decode_base64(payload_b64)
+  if not payload then
+    return false, nil, nil
   end
 
-  -- Rotate when remaining <= min(300, ttl/10) clamped to >= 60 (derived from CAPTCHA_EXPIRATION)
-  local ttl = tonumber(runtime.conf["CAPTCHA_EXPIRATION"])
-  local w = math.floor(ttl / 10)
-  if w < 60 then w = 60 end
-  if w > 300 then w = 300 end
-  local rotate = (exp_unix - now) <= w
+  -- parse the payload
+  local flags_s, uri_esc = payload:match("^(%-?%d+)%|(.*)$")
+  if not flags_s then
+    return false, nil, nil
+  end
 
-  return token, rotate
+  local flags = tonumber(flags_s)
+  if not flags then
+    return false, nil, nil
+  end
+
+  local previous_uri = nil
+  if uri_esc and uri_esc ~= "" then
+    previous_uri = ngx.unescape_uri(uri_esc)
+  end
+
+  return true, previous_uri, flags
 end
 
 local function escape_lua_pattern_char(ch)
@@ -283,14 +235,21 @@ local function captcha_cookie_domain()
   return replaced
 end
 
-local function set_captcha_cookie_signed(token)
+local function set_captcha_cookie_signed(flags, previous_uri)
   local name = captcha_cookie_name()
 
   local ttl = tonumber(runtime.conf["CAPTCHA_EXPIRATION"])
-  local exp_unix = ngx.time() + ttl
 
-  local sig = sign_cookie_value(token, exp_unix)
-  local cookie_val = token .. "." .. tostring(exp_unix) .. "." .. sig
+  local uri_esc = ""
+  if previous_uri and previous_uri ~= "" then
+    uri_esc = ngx.escape_uri(previous_uri)
+  end
+  local payload = tostring(flags) .. "|" .. uri_esc
+  local payload_b64 = ngx.encode_base64(payload)
+
+  local now = ngx.time()
+  local sig = sign_cookie_value(payload_b64, now)
+  local cookie_val = payload_b64 .. "." .. tostring(now) .. "." .. sig
 
   local attributes = { "Path=/", "HttpOnly", "SameSite=Lax" }
   local domain = captcha_cookie_domain()
@@ -301,6 +260,16 @@ local function set_captcha_cookie_signed(token)
 
   add_set_cookie(name .. "=" .. cookie_val .. "; " .. table.concat(attributes, "; "))
   return true
+end
+
+local function clear_captcha_cookie()
+  local name = captcha_cookie_name()
+  local attributes = { "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0" }
+  local domain = captcha_cookie_domain()
+  if domain and domain ~= "" then
+    table.insert(attributes, "Domain=" .. domain)
+  end
+  add_set_cookie(name .. "=; " .. table.concat(attributes, "; "))
 end
 
 --- init function
@@ -326,24 +295,6 @@ function csmod.init(configFile, userAgent)
 
   -- IMPORTANT: keep normal ngx shared dict cache for everything else (metrics, decisions, etc.)
   runtime.cache = ngx.shared.crowdsec_cache
-
-  runtime.captcha_cache = mc_cache.new({
-    primary = runtime.conf["MEMCACHED_PRIMARY"],
-    backup  = runtime.conf["MEMCACHED_BACKUP"],
-
-    -- optional tuning (if you add these to your config)
-    timeout_ms   = tonumber(runtime.conf["MEMCACHED_TIMEOUT_MS"]) or 20,
-    keepalive_ms = tonumber(runtime.conf["MEMCACHED_KEEPALIVE_MS"]) or 60000,
-    pool_size    = tonumber(runtime.conf["MEMCACHED_POOL_SIZE"]) or 100,
-
-    primary_backoff_sec = 10,
-
-    key_prefix = runtime.conf["MEMCACHED_KEY_PREFIX"] or "crowdsec:captcha:",
-
-    shm = ngx.shared.crowdsec_cache,
-  })
-  ngx.log(ngx.ERR, "[crowdsec] memc primary=", tostring(runtime.conf["MEMCACHED_PRIMARY"]),
-                 " backup=", tostring(runtime.conf["MEMCACHED_BACKUP"]))
 
   runtime.fallback = runtime.conf["FALLBACK_REMEDIATION"]
 
@@ -965,15 +916,10 @@ function csmod.Allow(ip)
   if captcha_ok then
     -- if captcha can be used (configuration is valid)
     -- we check if the IP needs to validate its captcha before checking it against CrowdSec local API
-    local token = nil
-    if captcha_state_mode() ~= "ip" then
-      token, _ = parse_and_verify_captcha_cookie()
-    end
-
-    local previous_uri, flags = captcha_get(ip, token)
+    local success, previous_uri, flags = parse_and_verify_captcha_cookie()
     local source, state_id, err = flag.GetFlags(flags)
 
-    if previous_uri ~= nil and state_id == flag.VERIFY_STATE then
+    if success and state_id == flag.VERIFY_STATE then
       ngx.req.read_body()
       local args, err = ngx.req.get_post_args()
 
@@ -993,23 +939,9 @@ function csmod.Allow(ip)
             -- we will not propose a captcha until the 'CAPTCHA_EXPIRATION'.
             -- But for the Application Security component, we serve the captcha each time the user triggers it.
             if source == flag.APPSEC_SOURCE then
-              captcha_del(ip, token)
+              clear_captcha_cookie()
             else
-              local succ, err, forcible = captcha_set(
-                ip,
-                token,
-                previous_uri,
-                runtime.conf["CAPTCHA_EXPIRATION"],
-                bit.bor(flag.VALIDATED_STATE, source)
-              )
-
-              if not succ then
-                ngx.log(ngx.ERR, "failed to add key about captcha state '" .. tostring(captcha_key(ip, token)) .. "' in cache: " .. err)
-              end
-
-              if forcible then
-                ngx.log(ngx.ERR, "Lua shared dict (crowdsec cache) is full, please increase dict size in config")
-              end
+              set_captcha_cookie_signed(bit.bor(flag.VALIDATED_STATE, source), "")
             end
 
             -- captcha is valid, we redirect the IP to its previous URI using the GET method
@@ -1030,31 +962,11 @@ function csmod.Allow(ip)
       end
       -- if the remediation is a captcha and captcha is well configured
       if remediation == "captcha" and captcha_ok and ngx.var.uri ~= "/favicon.ico" then
-          local token        = nil
-	  local previous_uri = nil
-	  local flags        = nil
-
-          if captcha_state_mode() ~= "ip" then
-            local rotate
-            token, rotate = parse_and_verify_captcha_cookie()
-
-            if not token then
-              token = generate_captcha_token()
-              set_captcha_cookie_signed(token)
-            elseif rotate then
-              local prev_uri_tmp, flags_tmp = captcha_get(ip, token)
-              local _, state_id_tmp = flag.GetFlags(flags_tmp)
-              if prev_uri_tmp == nil or state_id_tmp == flag.VALIDATED_STATE then
-                token = generate_captcha_token()
-                set_captcha_cookie_signed(token)
-              end
-            end
-	  end
-
-          previous_uri, flags = captcha_get(ip, token)
+          local success, previous_uri, flags = parse_and_verify_captcha_cookie()
           local source, state_id, err = flag.GetFlags(flags)
+
           -- we check if the IP is already in cache for captcha and not yet validated
-          if previous_uri == nil or state_id ~= flag.VALIDATED_STATE or remediationSource == flag.APPSEC_SOURCE then 
+          if not success or state_id ~= flag.VALIDATED_STATE or remediationSource == flag.APPSEC_SOURCE then 
               local uri = ngx.var.uri
               -- in case its not a GET request, we prefer to fallback on referer
               if ngx.req.get_method() ~= "GET" then
@@ -1065,17 +977,7 @@ function csmod.Allow(ip)
                   end
                 end
               end
-              local succ, err = captcha_set(
-                ip,
-                token,
-                uri,
-                60,
-                bit.bor(flag.VERIFY_STATE, remediationSource)
-              )
-              if not succ then
-                local cache_key = captcha_key(ip, token)
-                ngx.log(ngx.ERR, "failed to add key about captcha state '" .. tostring(cache_key) .. "' in cache: "..err)
-              end
+              set_captcha_cookie_signed(bit.bor(flag.VERIFY_STATE, remediationSource), uri)
               ngx.log(ngx.ALERT, "[Crowdsec] denied '" .. ip .. "' with '"..remediation.."'")
               captcha.apply()
               return
@@ -1084,8 +986,6 @@ function csmod.Allow(ip)
   end
   ngx.exit(ngx.DECLINED)
 end
-
-
 
 -- Use it if you are able to close at shuttime
 function csmod.close()

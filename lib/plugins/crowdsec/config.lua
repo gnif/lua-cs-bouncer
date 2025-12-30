@@ -6,29 +6,18 @@ local valid_params = {
   'REDIRECT_LOCATION', 'RET_CODE', 'CAPTCHA_RET_CODE', 'EXCLUDE_LOCATION',
   'FALLBACK_REMEDIATION', 'CAPTCHA_PROVIDER', 'APPSEC_URL', 'APPSEC_FAILURE_ACTION',
   'ALWAYS_SEND_TO_APPSEC', 'SSL_VERIFY', 'USE_TLS_AUTH', 'TLS_CLIENT_CERT', 'TLS_CLIENT_KEY',
-  'CAPTCHA_COOKIE_NAME', 'CAPTCHA_COOKIE_DOMAIN', 'CAPTCHA_STATE',
-
-  'MEMCACHED_PRIMARY',
-  'MEMCACHED_BACKUP',
-  'MEMCACHED_KEY_PREFIX',
+  'CAPTCHA_COOKIE_NAME', 'CAPTCHA_COOKIE_DOMAIN',
 }
 
 local valid_int_params = {
   'CACHE_EXPIRATION', 'CACHE_SIZE', 'REQUEST_TIMEOUT', 'UPDATE_FREQUENCY',
   'CAPTCHA_EXPIRATION', 'APPSEC_CONNECT_TIMEOUT', 'APPSEC_SEND_TIMEOUT',
   'APPSEC_PROCESS_TIMEOUT', 'STREAM_REQUEST_TIMEOUT',
-
-  'MEMCACHED_PORT',
-  'MEMCACHED_TIMEOUT_MS',
-  'MEMCACHED_KEEPALIVE_MS',
-  'MEMCACHED_POOL_SIZE',
-  'MEMCACHED_PRIMARY_BACKOFF_SEC',
 }
 
 -- CACHE_SIZE is not used in the code, but as it was valid parameter for the configuration file, not removing it now
 local valid_bouncing_on_type_values = {'ban', 'captcha', 'all'}
 local valid_truefalse_values = {'false', 'true'}
-local valid_captcha_state_values = {'ip', 'cookie', 'cookie_ip'}
 local default_values = {
     ['ENABLED'] = "true",
     ['ENABLE_INTERNAL'] = "false",
@@ -56,17 +45,7 @@ local default_values = {
     ['TLS_CLIENT_CERT'] = "",
     ['TLS_CLIENT_KEY'] = "",
     ['CAPTCHA_COOKIE_NAME'] = "crowdsec_captcha",
-    ['CAPTCHA_COOKIE_DOMAIN'] = "",
-    ['CAPTCHA_STATE'] = "ip",
- 
-    ['MEMCACHED_PRIMARY'] = "",
-    ['MEMCACHED_BACKUP']  = "",
-    ['MEMCACHED_KEY_PREFIX'] = "",
-    ['MEMCACHED_PORT'] = 11211,
-    ['MEMCACHED_TIMEOUT_MS'] = 50,
-    ['MEMCACHED_KEEPALIVE_MS'] = 60000,
-    ['MEMCACHED_POOL_SIZE'] = 200,
-    ['MEMCACHED_PRIMARY_BACKOFF_SEC'] = 10
+    ['CAPTCHA_COOKIE_DOMAIN'] = ""
 }
 
 function config.file_exists(file)
@@ -156,11 +135,6 @@ function config.loadConfig(file, default)
                 if not has_value({'captcha', 'ban'}, value) then
                 ngx.log(ngx.ERR, "unsupported value '" .. value .. "' for variable '" .. key .. "'. Using default value 'ban' instead")
                 value = "ban"
-                end
-            elseif key == "CAPTCHA_STATE" then
-                if not has_value(valid_captcha_state_values, value) then
-                ngx.log(ngx.ERR, "unsupported value '" .. value .. "' for variable '" .. key .. "'. Using default value 'ip' instead")
-                value = "ip"
                 end
             end
             conf[key] = value
